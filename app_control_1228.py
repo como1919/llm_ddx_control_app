@@ -1,0 +1,367 @@
+# --- sys.path bootstrap so absolute imports work when Streamlit sets CWD to this folder ---
+from pathlib import Path
+import sys
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+# -------------------------------------------------------------------------------
+
+import os
+import time
+import uuid
+import hashlib
+from typing import List
+from datetime import datetime, date
+
+import pandas as pd
+import streamlit as st
+
+# === dependency-free auto-refresh every N ms (keeps timer live) ===
+def auto_refresh(enabled: bool, interval_ms: int = 1000):
+    if not enabled:
+        return
+    st.markdown(
+        f"""
+        <script>
+        const __key = "st_js_autorefresh_{interval_ms}";
+        if (!window[__key]) {{
+          window[__key] = setInterval(() => {{
+            window.parent.postMessage({{isStreamlitMessage: true, type: "rerun"}}, "*");
+          }}, {interval_ms});
+        }}
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# --- app-specific imports (CONTROL) ---
+from llm_ddx_control_app.config import (
+    APP_TITLE,
+    TIME_LIMIT_MIN,
+    REQUIRE_AT_LEAST,
+    REQUIRE_AT_MOST,
+    AUTOSAVE_SEC,
+)
+from llm_ddx_control_app.data_io import read_uploaded_csv
+from llm_ddx_control_app.persistence import build_row, save_progress
+
+
+# ---------------------
+# CSV 다운로드 헬퍼
+# ---------------------
+def _append_buffer(row: dict):
+    """세션 버퍼에 현재 행을 누적 (배포 환경에서도 즉시 다운로드 가능)."""
+    buf = st.session_state.get("result_rows", [])
+    buf.append(row)
+    st.session_state["result_rows"] = buf
+
+def _current_results_df(participant_id: str) -> pd.DataFrame:
+    """로컬 CSV가 있으면 우선 사용, 없으면 세션 버퍼로 DataFrame 생성."""
+    today = date.today().strftime("%Y%m%d")
+    local_path = os.path.join("results", f"{participant_id}_control_{today}.csv")
+
+    # 로컬 CSV 우선 (로컬 실행 시)
+    if os.path.exists(local_path):
+        try:
+            return pd.read_csv(local_path)
+        except Exception:
+            pass
+
+    # 세션 버퍼 사용 (배포/원격 저장 시)
+    rows = st.session_state.get("result_rows", [])
+    if rows:
+        return pd.DataFrame(rows)
+
+    # 비어있으면 컬럼만 맞춘 빈 DF
+    return pd.DataFrame(
+        columns=[
+            "timestamp","session_uuid","participant_id","arm",
+            "case_index","cases_total","file_name","entered_ddx_list",
+            "notes","seconds_left",
+        ]
+    )
+
+def _local_control_path(participant_id: str) -> str:
+    today = date.today().strftime("%Y%m%d")
+    return os.path.join("results", f"{participant_id}_control_{today}.csv")
+
+def render_download_button(participant_id: str):
+    local_path = _local_control_path(participant_id)
+    df_src = None
+    if os.path.exists(local_path):
+        try:
+            df_src = pd.read_csv(local_path)
+        except Exception:
+            df_src = None
+
+    if df_src is None:
+        rows = st.session_state.get("result_rows", [])
+        df_src = pd.DataFrame(rows) if rows else pd.DataFrame()
+
+    if not df_src.empty:
+        df = df_src.copy()
+        if "save_ns" in df.columns:
+            df = df.sort_values("save_ns").drop_duplicates(
+                subset=["session_uuid", "case_index"], keep="last"
+            )
+        else:
+            df["__order__"] = range(len(df))
+            df = df.sort_values("__order__").drop_duplicates(
+                subset=["session_uuid", "case_index"], keep="last"
+            ).drop(columns="__order__", errors="ignore")
+
+        try:
+            os.makedirs("results", exist_ok=True)
+            tmp = f"{local_path}.tmp"
+            df.to_csv(tmp, index=False)
+            os.replace(tmp, local_path)
+            st.success("후처리 완료: 최신 1줄만 남기고 CSV를 갱신했습니다.")
+        except Exception as e:
+            st.info(f"로컬 저장은 생략하고, 후처리된 데이터만 다운로드합니다. ({e})")
+
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    else:
+        csv_bytes = pd.DataFrame().to_csv(index=False).encode("utf-8-sig")
+
+    today = date.today().strftime("%Y%m%d")
+    st.download_button(
+        label="📥 결과 CSV 다운로드",
+        data=csv_bytes,
+        file_name=f"{participant_id}_control_{today}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+# ---------------------
+# Utils
+# ---------------------
+def seconds_left() -> int:
+    start_ts = st.session_state.get("start_ts")
+    if not start_ts:
+        return TIME_LIMIT_MIN * 60
+    elapsed = (datetime.now() - start_ts).total_seconds()
+    return max(0, int(TIME_LIMIT_MIN * 60 - elapsed))
+
+def disabled() -> bool:
+    return seconds_left() <= 0 or st.session_state.get("finalized", False)
+
+def init_order(df_len: int, randomize: bool):
+    if "order" not in st.session_state:
+        idxs = list(range(df_len))
+        if randomize:
+            import random
+            random.Random(42).shuffle(idxs)
+        st.session_state.order = idxs
+        st.session_state.case_idx = 0
+        st.session_state["notes"] = ""
+
+def _ddx_key(i: int, row) -> str:
+    """file_name 기반 해시로 케이스별 위젯 키 충돌 방지."""
+    fid = str(row.get("file_name", ""))
+    h = hashlib.md5(fid.encode("utf-8")).hexdigest()[:8]
+    return f"ddx_{i}_{h}"
+
+def collect_inputs(row) -> List[str]:
+    return [st.session_state.get(_ddx_key(i, row), "").strip() for i in range(1, REQUIRE_AT_MOST + 1)]
+
+
+# ---------------------
+# Center pane (CONTROL): Editable HPI only (NO Model Suggestions)
+# ---------------------
+def render_center_hpi_only(row: pd.Series):
+    st.subheader("환자 초진 기록")
+    fid = str(row.get("file_name", ""))
+    h = hashlib.md5(fid.encode("utf-8")).hexdigest()[:8]
+    hkey = f"hpi_{h}"
+    default_hpi = row.get("원본 초진기록", row.get("현병력-Free Text#13", ""))
+
+    if hkey not in st.session_state:
+        st.session_state[hkey] = str(default_hpi)
+
+    st.text_area(
+        "raw_visit",
+        key=hkey,
+        height=460,
+        label_visibility="collapsed",
+    )
+
+
+# ---------------------
+# Main
+# ---------------------
+def main():
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+
+    # Auto-refresh every 1s while active (keeps timer live)
+    auto_refresh(
+        enabled=st.session_state.get("active") and not st.session_state.get("finalized", False),
+        interval_ms=1000,
+    )
+
+    # Sidebar
+    with st.sidebar:
+        st.header("CONTROL 설정 (대조군)")
+        uploaded = st.file_uploader("CSV 업로드", type=["csv"], accept_multiple_files=False)
+        participant_id = st.text_input("참가자 ID", value=st.session_state.get("participant_id", ""))
+        randomize_order = st.checkbox("증례 순서 무작위", value=True)
+        st.session_state["participant_id"] = participant_id
+
+        st.markdown("---")
+        st.caption(f"총 시간 제한: {TIME_LIMIT_MIN}분")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("세션 시작/재개", use_container_width=True):
+                if not participant_id:
+                    st.error("참가자 ID를 입력하세요.")
+                    st.stop()
+                if "start_ts" not in st.session_state:
+                    st.session_state.start_ts = datetime.now()
+                if "session_uuid" not in st.session_state:
+                    st.session_state.session_uuid = str(uuid.uuid4())
+                st.session_state.active = True
+                st.session_state.finalized = False
+        with c2:
+            if st.button("세션 종료", use_container_width=True):
+                st.session_state.finalized = True
+
+        st.markdown("---")
+        st.subheader("자동 저장")
+        st.caption(f"{AUTOSAVE_SEC}초마다 결과 저장")
+        st.write("최근 저장:", st.session_state.get("last_saved_ts", "(없음)"))
+
+        # 📥 CSV 다운로드 버튼
+        render_download_button(participant_id)
+
+    if not uploaded:
+        st.title(APP_TITLE)
+        st.info("좌측에서 CSV를 업로드하세요.")
+        return
+
+    df = read_uploaded_csv(uploaded)
+    init_order(len(df), randomize_order)
+
+    # Header
+    order = st.session_state.order
+    ci = st.session_state.case_idx
+    total = len(order)
+    sec = seconds_left()
+
+    top_left, top_right = st.columns([3, 1])
+    with top_left:
+        st.title(APP_TITLE)
+        st.progress((ci / max(1, total)), text=f"진행도: {ci}/{total}")
+    with top_right:
+        st.metric("남은 시간", f"{sec//60:02d}:{sec%60:02d}")
+
+    if not st.session_state.get("active"):
+        st.warning("좌측에서 '세션 시작/재개'를 눌러 시작하세요.")
+        return
+
+    if disabled():
+        st.error("시간 초과 또는 세션 종료됨. 입력이 비활성화되었습니다.")
+
+    row = df.iloc[order[ci]]
+
+    st.markdown(f"### 증례 {ci+1} / {total} — `{row['file_name']}`")
+
+    # Layout: center(HPI only) | right(inputs)
+    col_center, col_right = st.columns([5, 3])
+
+    with col_center:
+        render_center_hpi_only(row)
+
+    with col_right:
+        st.subheader("감별진단 입력 (3–5개)")
+        for i in range(1, REQUIRE_AT_MOST + 1):
+            st.text_input(f"감별진단 {i}", key=_ddx_key(i, row), disabled=disabled())
+        st.text_area("메모(선택)", key="notes", disabled=disabled())
+
+        if st.button("입력 초기화", disabled=disabled(), use_container_width=True):
+            for i in range(1, REQUIRE_AT_MOST + 1):
+                st.session_state[_ddx_key(i, row)] = ""
+            st.session_state["notes"] = ""
+            st.rerun()
+
+    # Validate & collect
+    inputs = collect_inputs(row)
+    non_empty = [d for d in inputs if d]
+    valid = REQUIRE_AT_LEAST <= len(non_empty) <= REQUIRE_AT_MOST
+
+    # Navigation
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        prev_disabled = ci == 0 or disabled()
+        if st.button("⬅️ 이전", disabled=prev_disabled):
+            row_out = build_row(
+                st.session_state.session_uuid,
+                participant_id,
+                ci,
+                total,
+                seconds_left(),
+                str(row["file_name"]),
+                non_empty,
+                st.session_state.get("notes", ""),
+            )
+            save_progress(participant_id, row_out)
+            _append_buffer(row_out)   # ✅ download buffer
+            st.session_state.case_idx -= 1
+            st.rerun()
+
+    with c2:
+        next_disabled = ci == total - 1 or disabled() or not valid
+        if st.button("다음 ➡️", disabled=next_disabled):
+            if not valid:
+                st.warning(f"감별진단을 {REQUIRE_AT_LEAST}–{REQUIRE_AT_MOST}개 입력하세요.")
+            else:
+                row_out = build_row(
+                    st.session_state.session_uuid,
+                    participant_id,
+                    ci,
+                    total,
+                    seconds_left(),
+                    str(row["file_name"]),
+                    non_empty,
+                    st.session_state.get("notes", ""),
+                )
+                save_progress(participant_id, row_out)
+                _append_buffer(row_out)   # ✅ download buffer
+                st.session_state.case_idx += 1
+                st.rerun()
+
+    with c3:
+        submit_disabled = ci != total - 1 or disabled() or not valid
+        if st.button("✅ 마지막 증례 제출 및 완료", disabled=submit_disabled):
+            row_out = build_row(
+                st.session_state.session_uuid,
+                participant_id,
+                ci,
+                total,
+                seconds_left(),
+                str(row["file_name"]),
+                non_empty,
+                st.session_state.get("notes", ""),
+            )
+            save_progress(participant_id, row_out)
+            _append_buffer(row_out)   # ✅ download buffer
+            st.session_state.finalized = True
+            st.success("저장 완료. 세션이 종료되었습니다.")
+
+    # Autosave heartbeat (no buffer append to avoid duplicates)
+    if not disabled() and (time.time() % AUTOSAVE_SEC < 1):
+        row_out = build_row(
+            st.session_state.session_uuid,
+            participant_id,
+            ci,
+            total,
+            seconds_left(),
+            str(row["file_name"]),
+            non_empty,
+            st.session_state.get("notes", ""),
+        )
+        save_progress(participant_id, row_out)
+        st.session_state["last_saved_ts"] = datetime.now().strftime("%H:%M:%S")
+
+
+if __name__ == "__main__":
+    main()
