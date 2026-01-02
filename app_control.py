@@ -207,7 +207,7 @@ def main():
         st.header("CONTROL 설정 (대조군)")
         uploaded = st.file_uploader("CSV 업로드", type=["csv"], accept_multiple_files=False)
         participant_id = st.text_input("참가자 ID", value=st.session_state.get("participant_id", ""))
-        randomize_order = st.checkbox("증례 순서 무작위", value=True)
+        randomize_order = st.checkbox("증례 순서 무작위", value=False)
         st.session_state["participant_id"] = participant_id
 
         st.markdown("---")
