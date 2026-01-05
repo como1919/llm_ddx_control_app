@@ -37,7 +37,7 @@ def auto_refresh(enabled: bool, interval_ms: int = 1000):
 # --- app-specific imports (CONTROL) ---
 from llm_ddx_control_app.config import (
     APP_TITLE,
-    TIME_LIMIT_MIN,
+    TIME_LIMIT_MIN,   # 이제는 사용하지 않지만, 다른 모듈 호환을 위해 그대로 import만 유지
     REQUIRE_AT_LEAST,
     REQUIRE_AT_MOST,
     AUTOSAVE_SEC,
@@ -77,7 +77,7 @@ def _current_results_df(participant_id: str) -> pd.DataFrame:
         columns=[
             "timestamp","session_uuid","participant_id","arm",
             "case_index","cases_total","file_name","entered_ddx_list",
-            "notes","seconds_left",
+            "notes","seconds_left",   # build_row와 호환 위해 컬럼명 유지
         ]
     )
 
@@ -136,15 +136,17 @@ def render_download_button(participant_id: str):
 # ---------------------
 # Utils
 # ---------------------
-def seconds_left() -> int:
+def elapsed_seconds() -> int:
+    """세션 시작 이후 경과 시간(초)만 기록 (제한시간 없음)."""
     start_ts = st.session_state.get("start_ts")
     if not start_ts:
-        return TIME_LIMIT_MIN * 60
+        return 0
     elapsed = (datetime.now() - start_ts).total_seconds()
-    return max(0, int(TIME_LIMIT_MIN * 60 - elapsed))
+    return max(0, int(elapsed))
 
 def disabled() -> bool:
-    return seconds_left() <= 0 or st.session_state.get("finalized", False)
+    """시간 제한 없이, 세션이 종료(finalized)된 경우에만 입력 비활성화."""
+    return st.session_state.get("finalized", False)
 
 def init_order(df_len: int, randomize: bool):
     if "order" not in st.session_state:
@@ -193,7 +195,8 @@ def render_center_hpi_only(row: pd.Series):
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-    # Auto-refresh every 1s while active (keeps timer live)
+    # Auto-refresh: 이제는 제한시간이 아니라,
+    # 경과 시간/자동저장을 위한 주기적 rerun 용도로만 사용.
     auto_refresh(
         enabled=st.session_state.get("active") and not st.session_state.get("finalized", False),
         interval_ms=1000,
@@ -204,11 +207,13 @@ def main():
         st.header("CONTROL 설정 (대조군)")
         uploaded = st.file_uploader("CSV 업로드", type=["csv"], accept_multiple_files=False)
         participant_id = st.text_input("참가자 ID", value=st.session_state.get("participant_id", ""))
-        randomize_order = st.checkbox("증례 순서 무작위", value=True)
+        randomize_order = st.checkbox("증례 순서 무작위", value=False)
         st.session_state["participant_id"] = participant_id
 
         st.markdown("---")
-        st.caption(f"총 시간 제한: {TIME_LIMIT_MIN}분")
+        # 더 이상 '총 시간 제한'은 없음 → 안내 문구만 간단히 변경
+        st.caption("세션 시작 시점부터의 경과 시간만 기록합니다. (시간 제한 없음)")
+
         c1, c2 = st.columns(2)
         with c1:
             if st.button("세션 시작/재개", use_container_width=True):
@@ -227,7 +232,7 @@ def main():
 
         st.markdown("---")
         st.subheader("자동 저장")
-        st.caption(f"{AUTOSAVE_SEC}초마다 결과 저장")
+        st.caption(f"{AUTOSAVE_SEC}초마다 결과 저장 (페이지가 열려 있는 동안)")
         st.write("최근 저장:", st.session_state.get("last_saved_ts", "(없음)"))
 
         # 📥 CSV 다운로드 버튼
@@ -245,21 +250,22 @@ def main():
     order = st.session_state.order
     ci = st.session_state.case_idx
     total = len(order)
-    sec = seconds_left()
+    sec = elapsed_seconds()
 
     top_left, top_right = st.columns([3, 1])
     with top_left:
         st.title(APP_TITLE)
         st.progress((ci / max(1, total)), text=f"진행도: {ci}/{total}")
     with top_right:
-        st.metric("남은 시간", f"{sec//60:02d}:{sec%60:02d}")
+        # 남은 시간 → 경과 시간 표시로 변경
+        st.metric("경과 시간", f"{sec//60:02d}:{sec%60:02d}")
 
     if not st.session_state.get("active"):
         st.warning("좌측에서 '세션 시작/재개'를 눌러 시작하세요.")
         return
 
     if disabled():
-        st.error("시간 초과 또는 세션 종료됨. 입력이 비활성화되었습니다.")
+        st.error("세션이 종료되었습니다. 입력이 비활성화되었습니다.")
 
     row = df.iloc[order[ci]]
 
@@ -288,6 +294,9 @@ def main():
     non_empty = [d for d in inputs if d]
     valid = REQUIRE_AT_LEAST <= len(non_empty) <= REQUIRE_AT_MOST
 
+    # 현재 시점 경과 시간 (로그용)
+    current_elapsed = elapsed_seconds()
+
     # Navigation
     c1, c2, c3 = st.columns([1, 1, 2])
     with c1:
@@ -298,7 +307,7 @@ def main():
                 participant_id,
                 ci,
                 total,
-                seconds_left(),
+                current_elapsed,  # seconds_left 대신 경과 시간 저장
                 str(row["file_name"]),
                 non_empty,
                 st.session_state.get("notes", ""),
@@ -319,7 +328,7 @@ def main():
                     participant_id,
                     ci,
                     total,
-                    seconds_left(),
+                    current_elapsed,  # seconds_left 대신 경과 시간
                     str(row["file_name"]),
                     non_empty,
                     st.session_state.get("notes", ""),
@@ -337,7 +346,7 @@ def main():
                 participant_id,
                 ci,
                 total,
-                seconds_left(),
+                current_elapsed,  # seconds_left 대신 경과 시간
                 str(row["file_name"]),
                 non_empty,
                 st.session_state.get("notes", ""),
@@ -347,14 +356,14 @@ def main():
             st.session_state.finalized = True
             st.success("저장 완료. 세션이 종료되었습니다.")
 
-    # Autosave heartbeat (no buffer append to avoid duplicates)
+    # Autosave heartbeat (제한시간 없이, 경과 시간을 로그로 저장)
     if not disabled() and (time.time() % AUTOSAVE_SEC < 1):
         row_out = build_row(
             st.session_state.session_uuid,
             participant_id,
             ci,
             total,
-            seconds_left(),
+            elapsed_seconds(),  # 현재까지의 경과 시간
             str(row["file_name"]),
             non_empty,
             st.session_state.get("notes", ""),

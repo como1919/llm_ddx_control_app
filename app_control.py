@@ -55,72 +55,71 @@ def _append_buffer(row: dict):
     buf.append(row)
     st.session_state["result_rows"] = buf
 
-def _current_results_df(participant_id: str) -> pd.DataFrame:
-    """로컬 CSV가 있으면 우선 사용, 없으면 세션 버퍼로 DataFrame 생성."""
-    today = date.today().strftime("%Y%m%d")
-    local_path = os.path.join("results", f"{participant_id}_control_{today}.csv")
-
-    # 로컬 CSV 우선 (로컬 실행 시)
-    if os.path.exists(local_path):
-        try:
-            return pd.read_csv(local_path)
-        except Exception:
-            pass
-
-    # 세션 버퍼 사용 (배포/원격 저장 시)
-    rows = st.session_state.get("result_rows", [])
-    if rows:
-        return pd.DataFrame(rows)
-
-    # 비어있으면 컬럼만 맞춘 빈 DF
-    return pd.DataFrame(
-        columns=[
-            "timestamp","session_uuid","participant_id","arm",
-            "case_index","cases_total","file_name","entered_ddx_list",
-            "notes","seconds_left",   # build_row와 호환 위해 컬럼명 유지
-        ]
-    )
 
 def _local_control_path(participant_id: str) -> str:
     today = date.today().strftime("%Y%m%d")
     return os.path.join("results", f"{participant_id}_control_{today}.csv")
 
 def render_download_button(participant_id: str):
+    """로컬 CSV + 세션 버퍼를 합쳐서 후처리 후 다운로드."""
     local_path = _local_control_path(participant_id)
-    df_src = None
+
+    dfs = []
+
+    # 1) 로컬 CSV가 있으면 읽기
     if os.path.exists(local_path):
         try:
-            df_src = pd.read_csv(local_path)
+            df_local = pd.read_csv(local_path)
+            dfs.append(df_local)
         except Exception:
-            df_src = None
+            pass
 
-    if df_src is None:
-        rows = st.session_state.get("result_rows", [])
-        df_src = pd.DataFrame(rows) if rows else pd.DataFrame()
+    # 2) 세션 버퍼(result_rows)도 함께 사용
+    rows = st.session_state.get("result_rows", [])
+    if rows:
+        df_buf = pd.DataFrame(rows)
+        dfs.append(df_buf)
 
+    # 3) 둘 다 없으면 빈 DF
+    if dfs:
+        df_src = pd.concat(dfs, ignore_index=True)
+    else:
+        df_src = pd.DataFrame()
+
+    # 4) 후처리 & 중복 제거
     if not df_src.empty:
         df = df_src.copy()
+
+        # 정렬 기준 먼저 결정: save_ns > timestamp > index
         if "save_ns" in df.columns:
-            df = df.sort_values("save_ns").drop_duplicates(
-                subset=["session_uuid", "case_index"], keep="last"
-            )
+            df = df.sort_values("save_ns")
+        elif "timestamp" in df.columns:
+            df = df.sort_values("timestamp")
         else:
             df["__order__"] = range(len(df))
-            df = df.sort_values("__order__").drop_duplicates(
-                subset=["session_uuid", "case_index"], keep="last"
-            ).drop(columns="__order__", errors="ignore")
+            df = df.sort_values("__order__")
 
+        df = df.drop_duplicates(
+            subset=["participant_id", "file_name"],  # 또는 ["participant_id", "case_index"]
+            keep="last",
+        )
+
+        # 임시 컬럼 정리
+        df = df.drop(columns=["__order__"], errors="ignore")
+
+        # 5) 로컬 파일도 최신 상태로 저장 (가능한 경우)
         try:
             os.makedirs("results", exist_ok=True)
             tmp = f"{local_path}.tmp"
             df.to_csv(tmp, index=False)
             os.replace(tmp, local_path)
-            st.success("후처리 완료: 최신 1줄만 남기고 CSV를 갱신했습니다.")
+            #st.success("후처리 완료: 최신 1줄만 남기고 CSV를 갱신했습니다.")
         except Exception as e:
             st.info(f"로컬 저장은 생략하고, 후처리된 데이터만 다운로드합니다. ({e})")
 
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
     else:
+        # 데이터가 하나도 없을 때
         csv_bytes = pd.DataFrame().to_csv(index=False).encode("utf-8-sig")
 
     today = date.today().strftime("%Y%m%d")
@@ -207,7 +206,7 @@ def main():
         st.header("CONTROL 설정 (대조군)")
         uploaded = st.file_uploader("CSV 업로드", type=["csv"], accept_multiple_files=False)
         participant_id = st.text_input("참가자 ID", value=st.session_state.get("participant_id", ""))
-        randomize_order = st.checkbox("증례 순서 무작위", value=False)
+        #randomize_order = st.checkbox("증례 순서 무작위", value=False)
         st.session_state["participant_id"] = participant_id
 
         st.markdown("---")
@@ -230,13 +229,11 @@ def main():
             if st.button("세션 종료", use_container_width=True):
                 st.session_state.finalized = True
 
-        st.markdown("---")
-        st.subheader("자동 저장")
-        st.caption(f"{AUTOSAVE_SEC}초마다 결과 저장 (페이지가 열려 있는 동안)")
-        st.write("최근 저장:", st.session_state.get("last_saved_ts", "(없음)"))
+        #st.markdown("---")
+        #st.subheader("자동 저장")
+        #st.caption(f"{AUTOSAVE_SEC}초마다 결과 저장 (페이지가 열려 있는 동안)")
+        #st.write("최근 저장:", st.session_state.get("last_saved_ts", "(없음)"))
 
-        # 📥 CSV 다운로드 버튼
-        render_download_button(participant_id)
 
     if not uploaded:
         st.title(APP_TITLE)
@@ -244,7 +241,7 @@ def main():
         return
 
     df = read_uploaded_csv(uploaded)
-    init_order(len(df), randomize_order)
+    init_order(len(df), randomize=False)
 
     # Header
     order = st.session_state.order
@@ -283,11 +280,11 @@ def main():
             st.text_input(f"감별진단 {i}", key=_ddx_key(i, row), disabled=disabled())
         st.text_area("메모(선택)", key="notes", disabled=disabled())
 
-        if st.button("입력 초기화", disabled=disabled(), use_container_width=True):
-            for i in range(1, REQUIRE_AT_MOST + 1):
-                st.session_state[_ddx_key(i, row)] = ""
-            st.session_state["notes"] = ""
-            st.rerun()
+        #if st.button("입력 초기화", disabled=disabled(), use_container_width=True):
+            #for i in range(1, REQUIRE_AT_MOST + 1):
+            #    st.session_state[_ddx_key(i, row)] = ""
+            #st.session_state["notes"] = ""
+            #st.rerun()
 
     # Validate & collect
     inputs = collect_inputs(row)
@@ -340,7 +337,7 @@ def main():
 
     with c3:
         submit_disabled = ci != total - 1 or disabled() or not valid
-        if st.button("✅ 마지막 증례 제출 및 완료", disabled=submit_disabled):
+        if st.button("✅ 마지막 증례 저장", disabled=submit_disabled):
             row_out = build_row(
                 st.session_state.session_uuid,
                 participant_id,
@@ -354,22 +351,28 @@ def main():
             save_progress(participant_id, row_out)
             _append_buffer(row_out)   # ✅ download buffer
             st.session_state.finalized = True
-            st.success("저장 완료. 세션이 종료되었습니다.")
+            st.success("세션이 종료되었습니다. 좌측 하단의 결과 csv 다운로드 버튼을 클릭하세요.")
 
     # Autosave heartbeat (제한시간 없이, 경과 시간을 로그로 저장)
-    if not disabled() and (time.time() % AUTOSAVE_SEC < 1):
+    if not disabled():
         row_out = build_row(
             st.session_state.session_uuid,
             participant_id,
             ci,
             total,
-            elapsed_seconds(),  # 현재까지의 경과 시간
+            elapsed_seconds(),
             str(row["file_name"]),
             non_empty,
             st.session_state.get("notes", ""),
         )
         save_progress(participant_id, row_out)
+        _append_buffer(row_out)
         st.session_state["last_saved_ts"] = datetime.now().strftime("%H:%M:%S")
+
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("결과 다운로드")
+        render_download_button(participant_id)
 
 
 if __name__ == "__main__":
