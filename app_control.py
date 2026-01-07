@@ -253,9 +253,8 @@ def main():
     with top_left:
         st.title(APP_TITLE)
         st.progress((ci / max(1, total)), text=f"진행도: {ci}/{total}")
-    with top_right:
-        # 남은 시간 → 경과 시간 표시로 변경
-        st.metric("경과 시간", f"{sec//60:02d}:{sec%60:02d}")
+    #with top_right:
+    #    st.metric("경과 시간", f"{sec//60:02d}:{sec%60:02d}")
 
     if not st.session_state.get("active"):
         st.warning("좌측에서 '세션 시작/재개'를 눌러 시작하세요.")
@@ -304,7 +303,7 @@ def main():
                 participant_id,
                 ci,
                 total,
-                current_elapsed,  # seconds_left 대신 경과 시간 저장
+                current_elapsed,  # seconds 대신 경과 시간 저장
                 str(row["file_name"]),
                 non_empty,
                 st.session_state.get("notes", ""),

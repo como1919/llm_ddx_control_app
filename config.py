@@ -12,11 +12,3 @@ REQUIRED_COLS = [
     "file_name",
     "현병력-Free Text#13"
 ]
-"""
-REQUIRED_COLS = [
-    "file_name",
-    "현병력-Free Text#13",
-    "expected_diagnosis_applied",
-    "differential_diagnoses_applied",
-    "raw_response_applied",
-]"""

@@ -1,0 +1,6 @@
+timestamp,session_uuid,participant_id,arm,case_index,cases_total,file_name,entered_ddx_list,notes,seconds
+2026-01-07 14:59:12,ae7c4af7-974d-4feb-9287-d21ed8d57742,qq,control,1,5,modified_SMC_DataCuration_2039.txt,"[""1"", ""1"", ""1""]",,4
+2026-01-07 14:59:15,ae7c4af7-974d-4feb-9287-d21ed8d57742,qq,control,2,5,modified_SMC_DataCuration_2041.txt,"[""2"", ""2"", ""2""]",,7
+2026-01-07 14:59:17,ae7c4af7-974d-4feb-9287-d21ed8d57742,qq,control,3,5,modified_SMC_DataCuration_2043.txt,"[""3"", ""3"", ""3""]",,9
+2026-01-07 14:59:27,ae7c4af7-974d-4feb-9287-d21ed8d57742,qq,control,4,5,modified_SMC_DataCuration_2044.txt,"[""4"", ""4"", ""4"", ""4""]",,19
+2026-01-07 14:59:31,ae7c4af7-974d-4feb-9287-d21ed8d57742,qq,control,5,5,modified_SMC_DataCuration_2072.txt,"[""5"", ""5"", ""5""]",,23

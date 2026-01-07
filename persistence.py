@@ -83,7 +83,7 @@ def build_row(
         "file_name": file_name,
         "entered_ddx_list": json.dumps(ddx_list, ensure_ascii=False),
         "notes": notes,
-        "seconds_left": seconds_left,
+        "seconds": seconds_left,
     }
 
 
